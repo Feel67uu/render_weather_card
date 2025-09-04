@@ -1,139 +1,277 @@
 # scripts/render.py
-import os, json
+import json
+import os
 from pathlib import Path
+from datetime import datetime, timedelta
+
 from PIL import Image, ImageDraw, ImageFont
 
-# ---------- helpers ----------
-def load_font(path_candidates, size):
-    for p in path_candidates:
-        if Path(p).exists():
-            try:
-                return ImageFont.truetype(str(p), size=size)
-            except Exception:
-                pass
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None
+
+
+# ---------- пути ----------
+ROOT = Path(__file__).resolve().parents[1]
+ASSETS = ROOT / "assets"
+ICONS = ASSETS / "icons"
+BASE_PANEL = ASSETS / "base_weather_plain_panel.png"
+OUT_DIR = ROOT / "weather"
+
+
+# ---------- шрифты ----------
+def load_first_font(size: int, candidates=None):
+    if candidates is None:
+        candidates = [
+            ASSETS / "fonts" / "Manrope-SemiBold.ttf",
+            ASSETS / "fonts" / "PTSansCaption-Bold.ttf",
+            ASSETS / "fonts" / "Inter-SemiBold.ttf",
+            ASSETS / "fonts" / "Roboto-Bold.ttf",
+        ]
+    for p in candidates:
+        try:
+            return ImageFont.truetype(str(p), size=size)
+        except Exception:
+            continue
+    # запасной вариант
     return ImageFont.load_default()
 
-def draw_text_centered(draw, xy_center, text, font, fill=(255,255,255,255), stroke=2):
-    x, y = xy_center
-    w, h = draw.textbbox((0,0), text, font=font, stroke_width=stroke)[2:]
-    draw.text((x - w/2, y - h/2), text, font=font, fill=fill,
-              stroke_width=stroke, stroke_fill=(0,0,0,160))
 
-def icon_name_by_wmo(code:int)->str:
-    if code in (0,):            return "sun"
-    if code in (1,2,3,45,48):   return "cloud"
-    if 51 <= code <= 67:        return "rain"
-    if 71 <= code <= 77:        return "snow"
-    if 95 <= code <= 99:        return "storm"
-    return "cloud"
+FONT_TITLE = load_first_font(64)
+FONT_DATE = load_first_font(36, [
+    ASSETS / "fonts" / "Manrope-Regular.ttf",
+    ASSETS / "fonts" / "PTSansCaption-Regular.ttf",
+    ASSETS / "fonts" / "Inter-Regular.ttf",
+    ASSETS / "fonts" / "Roboto-Regular.ttf",
+])
+FONT_BIG = load_first_font(72)
+FONT_REG = load_first_font(44, [
+    ASSETS / "fonts" / "Manrope-Medium.ttf",
+    ASSETS / "fonts" / "PTSansCaption-Regular.ttf",
+    ASSETS / "fonts" / "Inter-Medium.ttf",
+    ASSETS / "fonts" / "Roboto-Medium.ttf",
+])
+FONT_SMALL = load_first_font(40, [
+    ASSETS / "fonts" / "Manrope-Regular.ttf",
+    ASSETS / "fonts" / "PTSansCaption-Regular.ttf",
+    ASSETS / "fonts" / "Inter-Regular.ttf",
+    ASSETS / "fonts" / "Roboto-Regular.ttf",
+])
 
-def to_float(x):
+WHITE = (255, 255, 255, 255)
+
+
+# ---------- форматтеры ----------
+def fmt_temp(v) -> str:
     try:
-        if x is None: return None
-        # иногда из Make прилетает строка — приводим
-        return float(x)
-    except (TypeError, ValueError):
-        return None
+        fv = float(v)
+    except Exception:
+        return "--°C"
+    return f"{int(round(fv)):+d}°C"  # +12°C / -5°C
 
-def fmt_num(x):
-    return f"{int(round(x))}" if x is not None else "—"
 
-# ---------- read payload ----------
-event_path = os.environ["GITHUB_EVENT_PATH"]
-event_obj = json.load(open(event_path, "r"))
-payload = event_obj.get("client_payload", {})
+def fmt_wind(v) -> str:
+    try:
+        fv = float(v)
+    except Exception:
+        return "ветер --"
+    return f"ветер {int(round(fv))}"
 
-job_id = payload.get("job_id", "no_job")
-tz     = payload.get("tz","")
-date   = payload.get("date","")
-cities = payload.get("cities", [])  # ожидаем до 2 городов
 
-# ---------- assets ----------
-ROOT   = Path(__file__).resolve().parents[1]
-assets = ROOT / "assets"
-icons  = assets / "icons"
+def fmt_rain(p) -> str:
+    try:
+        fp = float(p)
+    except Exception:
+        return "дождь --%"
+    return f"дождь {int(round(fp))}%"
 
-base_path = assets / "base_weather_plain_panel.png"
-base = Image.open(base_path).convert("RGBA")
-W, H = base.size
 
-fonts_dir = assets / "fonts"
-font_bold  = load_font([
-    fonts_dir/"Inter-SemiBold.ttf",
-    fonts_dir/"Roboto-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-], size=46)
-font_reg   = load_font([
-    fonts_dir/"Inter-Regular.ttf",
-    fonts_dir/"Roboto-Regular.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-], size=36)
-font_small = load_font([
-    fonts_dir/"Inter-Regular.ttf",
-    fonts_dir/"Roboto-Regular.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-], size=28)
+RU_DOW = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+RU_MON = ["янв", "фев", "мар", "apr", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
 
-img = base.copy()
-draw = ImageDraw.Draw(img)
 
-if date or tz:
-    hdr = f"{date} • {tz}".strip(" •")
-    draw_text_centered(draw, (W/2, 40), hdr, font_small)
+def ru_date_short_for_tomorrow(today_iso: str, tz: str) -> str:
+    """
+    today_iso: 'YYYY-MM-DD'
+    tz: IANA timezone, напр. 'Asia/Novokuznetsk'
+    Возвращает 'Чт, 5 сен' для ЗАВТРА.
+    """
+    try:
+        dt = datetime.strptime(today_iso, "%Y-%m-%d")
+    except Exception:
+        dt = datetime.utcnow()
+    if ZoneInfo and tz:
+        try:
+            dt = dt.replace(tzinfo=ZoneInfo(tz))
+        except Exception:
+            pass
+    d = (dt + timedelta(days=1)).date()
+    return f"{RU_DOW[d.weekday()]}, {d.day} {RU_MON[d.month - 1]}"
 
-panels = [
-    (0, 0, W//2, H),
-    (W//2, 0, W, H),
-]
 
-def paste_icon(center_xy, icon_name):
-    p = icons / f"{icon_name}.png"
+# ---------- иконки ----------
+def icon_path_for_code(code_val) -> Path:
+    """
+    Примитивный маппинг кодов в иконки.
+    Поддерживает типичные диапазоны: гроза, снег, дождь, облачно, ясно.
+    """
+    try:
+        code = int(code_val)
+    except Exception:
+        code = None
+
+    name = "cloud"  # по умолчанию
+
+    if code is None:
+        name = "cloud"
+    else:
+        if code >= 95:
+            name = "storm"
+        elif 71 <= code <= 79 or code in (85, 86):
+            name = "snow"
+        elif 80 <= code <= 84 or 51 <= code <= 67 or 61 <= code <= 65:
+            name = "rain"
+        elif code == 0:
+            name = "sun"
+        else:
+            # лёгкая облачность/облачно
+            name = "cloud"
+
+    p = ICONS / f"{name}.png"
     if not p.exists():
-        p = icons / "cloud.png"
-    ico = Image.open(p).convert("RGBA")
-    target_h = int(H * 0.45)
-    ratio = target_h / ico.height
-    ico = ico.resize((int(ico.width*ratio), target_h), Image.LANCZOS)
-    x = int(center_xy[0]-ico.width/2)
-    y = int(center_xy[1]-ico.height/2)
-    img.alpha_composite(ico, (x,y))
+        # запасные имена
+        for alt in ("cloud.png", "sun.png", "rain.png", "snow.png", "storm.png"):
+            q = ICONS / alt
+            if q.exists():
+                return q
+    return p
 
-def render_city(panel_box, city):
-    L, T, R, B = panel_box
-    cx = (L + R)//2
 
-    name = city.get("name","")
-    cur  = city.get("current", {}) or {}
-    daily= city.get("daily", {}) or {}
+# ---------- чтение payload ----------
+def load_client_payload():
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    payload = None
 
-    temp = to_float(cur.get("temp"))
-    wind = to_float(cur.get("wind"))
-    code = int(to_float(cur.get("code")) or 0)
+    if event_path and Path(event_path).exists():
+        with open(event_path, "r", encoding="utf-8") as f:
+            event = json.load(f)
+        payload = event.get("client_payload")
 
-    tmax = to_float(daily.get("tmax"))
-    tmin = to_float(daily.get("tmin"))
-    pr   = to_float(daily.get("precip"))
+        # Если пришла строка — распарсим в объект
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                pass
 
-    draw_text_centered(draw, (cx, T + 80), name, font_bold)
-    paste_icon((cx, T + int(H*0.48)), icon_name_by_wmo(code))
+    # страховка: если никак, попробуем локальный файл
+    if payload is None:
+        local = ROOT / "client_payload.json"
+        if local.exists():
+            with open(local, "r", encoding="utf-8") as f:
+                payload = json.load(f)
 
-    line1 = f"{fmt_num(temp)}°C  •  wind {fmt_num(wind)}"
-    draw_text_centered(draw, (cx, T + int(H*0.78)), line1, font_reg)
+    return payload or {}
 
-    tail = []
-    if tmin is not None and tmax is not None:
-        tail.append(f"{fmt_num(tmin)}…{fmt_num(tmax)}°C")
-    if pr is not None:
-        tail.append(f"rain {fmt_num(pr)}%")
-    if tail:
-        draw_text_centered(draw, (cx, T + int(H*0.90)), "  •  ".join(tail), font_small)
 
-for i, panel in enumerate(panels):
-    data = cities[i] if i < len(cities) else {}
-    render_city(panel, data)
+# ---------- рендер одной колонки ----------
+def render_city(draw: ImageDraw.ImageDraw, panel: Image.Image, city: dict, cx: int, top_y: int, date_text: str):
+    """
+    cx — центр колонки по X
+    top_y — верхняя базовая Y для заголовка
+    """
+    name = str(city.get("name", "—")).strip()
 
-out_dir = ROOT / "weather"
-out_dir.mkdir(parents=True, exist_ok=True)
-out_path = out_dir / f"{job_id}.png"
-img.save(out_path, format="PNG")
-print("Saved", out_path)
+    # заголовок (название города)
+    draw.text((cx, top_y), name, font=FONT_TITLE, fill=WHITE, anchor="mm")
+
+    # дата (на завтра) под названием
+    draw.text((cx, top_y + 42), date_text, font=FONT_DATE, fill=WHITE, anchor="mm")
+
+    # иконка
+    code = (city.get("current") or {}).get("code")
+    icon_file = icon_path_for_code(code)
+    try:
+        icon = Image.open(icon_file).convert("RGBA")
+    except Exception:
+        icon = Image.new("RGBA", (256, 256), (255, 255, 255, 0))
+
+    # подгоним иконку до приятного размера
+    max_w = int(panel.width * 0.22)
+    if icon.width > max_w:
+        ratio = max_w / icon.width
+        icon = icon.resize((int(icon.width * ratio), int(icon.height * ratio)), Image.LANCZOS)
+
+    icon_y = top_y + 120
+    panel.alpha_composite(icon, (cx - icon.width // 2, icon_y))
+
+    # текущие показатели
+    cur = city.get("current") or {}
+    temp = fmt_temp(cur.get("temp"))
+    wind = fmt_wind(cur.get("wind"))
+
+    # строка "температура • ветер"
+    text_line = f"{temp}  •  {wind}"
+    draw.text((cx, icon_y + icon.height + 60), text_line, font=FONT_REG, fill=WHITE, anchor="mm")
+
+    # нижняя строка: диапазон и осадки
+    daily = city.get("daily") or {}
+    tmin = fmt_temp(daily.get("tmin"))
+    tmax = fmt_temp(daily.get("tmax"))
+    precip = fmt_rain(daily.get("precip_prob") if "precip_prob" in daily else daily.get("precip"))
+
+    range_text = f"{tmin}…{tmax}"
+    bottom_y = panel.height - 90
+
+    # слева диапазон, справа осадки
+    draw.text((cx - 150, bottom_y), range_text, font=FONT_SMALL, fill=WHITE, anchor="rm")
+    draw.text((cx + 150, bottom_y), precip, font=FONT_SMALL, fill=WHITE, anchor="lm")
+
+
+def main():
+    payload = load_client_payload()
+
+    # базовая панель
+    if not BASE_PANEL.exists():
+        raise FileNotFoundError(f"Не найден фон: {BASE_PANEL}")
+    panel = Image.open(BASE_PANEL).convert("RGBA")
+    draw = ImageDraw.Draw(panel)
+
+    # данные
+    tz = payload.get("tz") or payload.get("timezone") or ""
+    today_iso = payload.get("date") or datetime.utcnow().strftime("%Y-%m-%d")
+    date_tomorrow_text = ru_date_short_for_tomorrow(today_iso, tz)
+
+    cities = payload.get("cities") or []
+    # ожидаем 2 города; если пришёл 1 — дублируем; если больше — берём первые два
+    if len(cities) == 0:
+        cities = [{"name": "—", "current": {}, "daily": {}} , {"name": "—", "current": {}, "daily": {}}]
+    elif len(cities) == 1:
+        cities = cities * 2
+    else:
+        cities = cities[:2]
+
+    # геометрия: центры колонок
+    W, H = panel.size
+    cx_left, cx_right = int(W * 0.25), int(W * 0.75)
+    title_y = 110  # базовый y для заголовка
+
+    # РИСУЕМ ДВЕ КОЛОНКИ
+    render_city(draw, panel, cities[0], cx_left, title_y, date_tomorrow_text)
+    render_city(draw, panel, cities[1], cx_right, title_y, date_tomorrow_text)
+
+    # сохранение
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    job_id = (payload.get("job_id") or "").strip()
+    if not job_id:
+        out = OUT_DIR / "no_job.png"
+    else:
+        out = OUT_DIR / f"filler-{job_id}.png"
+
+    panel.save(out)
+    print(f"Saved {out}")
+
+
+if __name__ == "__main__":
+    main()
