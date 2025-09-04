@@ -1,100 +1,142 @@
 # scripts/render.py
-import os, json, math
+import os, json
+from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
-# ---------- utils ----------
-def _payload():
-    """Read client_payload from the GitHub event file."""
-    ev_path = os.environ.get("GITHUB_EVENT_PATH")
-    if not ev_path or not os.path.exists(ev_path):
-        return {}
-    with open(ev_path, "r", encoding="utf-8") as f:
-        ev = json.load(f)
-    return (ev or {}).get("client_payload", {}) or {}
-
-def _as_lines(x):
-    """Accept list or string with \\n, return list[str] without empties around."""
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return [str(s).strip() for s in x if str(s).strip() != ""]
-    # string
-    return [s.strip() for s in str(x).replace("\r", "").split("\n")]
-
-def _pick_font(size, bold=False):
-    """Pick a font with Cyrillic support."""
-    cands = []
-    if bold:
-        cands += [
-            "assets/fonts/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ]
-    else:
-        cands += [
-            "assets/fonts/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ]
-    for p in cands:
-        if os.path.exists(p):
+# ---------- helpers ----------
+def load_font(path_candidates, size):
+    for p in path_candidates:
+        if Path(p).exists():
             try:
-                return ImageFont.truetype(p, size=size)
+                return ImageFont.truetype(str(p), size=size)
             except Exception:
                 pass
+    # абсолютно fallback
     return ImageFont.load_default()
 
-# ---------- main ----------
-def main():
-    p = _payload()
-    job_id = str(p.get("job_id") or "demo").strip()
+def draw_text_centered(draw, xy_center, text, font, fill=(255,255,255,255), stroke=2):
+    x, y = xy_center
+    w, h = draw.textbbox((0,0), text, font=font, stroke_width=stroke)[2:]
+    draw.text((x - w/2, y - h/2), text, font=font, fill=fill,
+              stroke_width=stroke, stroke_fill=(0,0,0,160))
 
-    head  = str(p.get("head") or "").strip()
-    left  = _as_lines(p.get("left"))
-    right = _as_lines(p.get("right"))
-    icon  = str(p.get("icon") or "sun").strip().lower()
+def icon_name_by_wmo(code:int)->str:
+    # очень простое сопоставление
+    if code in (0,):            return "sun"
+    if code in (1,2,3,45,48):   return "cloud"
+    if 51 <= code <= 67:        return "rain"
+    if 71 <= code <= 77:        return "snow"
+    if 95 <= code <= 99:        return "storm"
+    return "cloud"
 
-    # base & icons
-    base_path = "assets/base_weather_plain_panel.png"
-    if not os.path.exists(base_path):
-        raise FileNotFoundError(f"Missing {base_path}")
+# ---------- read payload ----------
+event_path = os.environ["GITHUB_EVENT_PATH"]
+payload = json.load(open(event_path, "r")).get("client_payload", {})
 
-    base = Image.open(base_path).convert("RGBA")
-    W, H = base.size
-    draw = ImageDraw.Draw(base)
+job_id = payload.get("job_id", "no_job")
+tz     = payload.get("tz","")
+date   = payload.get("date","")
+cities = payload.get("cities", [])  # ожидаем ровно 2
 
-    # fonts
-    head_font = _pick_font(size=max(34, H // 13), bold=True)
-    body_font = _pick_font(size=max(20, H // 23), bold=False)
+# ---------- assets ----------
+ROOT   = Path(__file__).resolve().parents[1]  # корень репозитория
+assets = ROOT / "assets"
+icons  = assets / "icons"
 
-    # icon
-    icon_path = f"assets/icons/{icon}.png"
-    if os.path.exists(icon_path):
-        ico = Image.open(icon_path).convert("RGBA")
-        size = int(min(W, H) * 0.22)
-        ico = ico.resize((size, size), Image.LANCZOS)
-        base.paste(ico, (int(W * 0.06), int(H * 0.20)), ico)
+# фон
+base_path = assets / "base_weather_plain_panel.png"
+base = Image.open(base_path).convert("RGBA")
+W, H = base.size
 
-    # head
-    if head:
-        draw.text((int(W * 0.40), int(H * 0.10)), head, fill=(255, 255, 255, 255), font=head_font)
+# шрифты (загрузи свои ttf в assets/fonts, напр. Inter)
+fonts_dir = assets / "fonts"
+font_bold  = load_font([
+    fonts_dir/"Inter-SemiBold.ttf",
+    fonts_dir/"Roboto-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+], size=46)
 
-    # columns
-    start_y = int(H * 0.55)
-    line_h = int(body_font.size * 1.4)
-    left_x  = int(W * 0.08)
-    right_x = int(W * 0.56)
+font_reg   = load_font([
+    fonts_dir/"Inter-Regular.ttf",
+    fonts_dir/"Roboto-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+], size=36)
 
-    for i, line in enumerate(left[:10]):   # ограничим, чтобы не вылезало
-        draw.text((left_x, start_y + i * line_h), line, fill=(255, 255, 255, 255), font=body_font)
+font_small = load_font([
+    fonts_dir/"Inter-Regular.ttf",
+    fonts_dir/"Roboto-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+], size=28)
 
-    for i, line in enumerate(right[:10]):
-        draw.text((right_x, start_y + i * line_h), line, fill=(255, 255, 255, 255), font=body_font)
+# холст
+img = base.copy()
+draw = ImageDraw.Draw(img)
 
-    # output
-    out_dir = "weather"
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{job_id}.png")
-    base.save(out_path, "PNG")
-    print("Saved:", out_path)
+# верхняя строка (дата/таймзона)
+if date or tz:
+    hdr = f"{date} • {tz}".strip(" •")
+    draw_text_centered(draw, (W/2, 40), hdr, font_small)
 
-if __name__ == "__main__":
-    main()
+# разбивка холста на 2 равные панели
+panels = [
+    (0, 0, W//2, H),
+    (W//2, 0, W, H),
+]
+
+def paste_icon(center_xy, icon_name):
+    p = icons / f"{icon_name}.png"
+    if not p.exists():
+        p = icons / "cloud.png"
+    ico = Image.open(p).convert("RGBA")
+    # масштаб под высоту панели
+    target_h = int(H * 0.45)
+    ratio = target_h / ico.height
+    ico = ico.resize((int(ico.width*ratio), target_h), Image.LANCZOS)
+    x = int(center_xy[0]-ico.width/2)
+    y = int(center_xy[1]-ico.height/2)
+    img.alpha_composite(ico, (x,y))
+
+def render_city(panel_box, city):
+    L, T, R, B = panel_box
+    cx = (L + R)//2
+
+    name = city.get("name","")
+    cur  = city.get("current", {})
+    daily= city.get("daily", {})
+    temp = cur.get("temp")
+    wind = cur.get("wind")
+    code = int(cur.get("code") or 0)
+    tmax = daily.get("tmax")
+    tmin = daily.get("tmin")
+    pr   = daily.get("precip")
+
+    # название города
+    draw_text_centered(draw, (cx, T + 80), name, font_bold)
+
+    # иконка
+    paste_icon((cx, T + int(H*0.48)), icon_name_by_wmo(code))
+
+    # температура, ветер
+    line1 = f"{round(temp)}°C  •  wind {round(wind)}"
+    draw_text_centered(draw, (cx, T + int(H*0.78)), line1, font_reg)
+
+    # min/max/precip
+    tail = []
+    if tmin is not None and tmax is not None:
+        tail.append(f"{round(tmin)}…{round(tmax)}°C")
+    if pr is not None:
+        tail.append(f"rain {round(pr)}%")
+    if tail:
+        draw_text_centered(draw, (cx, T + int(H*0.90)), "  •  ".join(tail), font_small)
+
+# гарантируем 2 панели (если пришёл 1 город — нарисуем его слева)
+for i, panel in enumerate(panels):
+    data = cities[i] if i < len(cities) else {}
+    render_city(panel, data)
+
+# запись файла
+out_dir = ROOT / "weather"
+out_dir.mkdir(parents=True, exist_ok=True)
+out_path = out_dir / f"{job_id}.png"
+img.save(out_path, format="PNG")
+print("Saved", out_path)
