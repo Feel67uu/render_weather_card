@@ -1,0 +1,1 @@
+render_weather_card
