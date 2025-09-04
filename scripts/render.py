@@ -11,7 +11,6 @@ def load_font(path_candidates, size):
                 return ImageFont.truetype(str(p), size=size)
             except Exception:
                 pass
-    # абсолютно fallback
     return ImageFont.load_default()
 
 def draw_text_centered(draw, xy_center, text, font, fill=(255,255,255,255), stroke=2):
@@ -21,7 +20,6 @@ def draw_text_centered(draw, xy_center, text, font, fill=(255,255,255,255), stro
               stroke_width=stroke, stroke_fill=(0,0,0,160))
 
 def icon_name_by_wmo(code:int)->str:
-    # очень простое сопоставление
     if code in (0,):            return "sun"
     if code in (1,2,3,45,48):   return "cloud"
     if 51 <= code <= 67:        return "rain"
@@ -29,55 +27,60 @@ def icon_name_by_wmo(code:int)->str:
     if 95 <= code <= 99:        return "storm"
     return "cloud"
 
+def to_float(x):
+    try:
+        if x is None: return None
+        # иногда из Make прилетает строка — приводим
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+def fmt_num(x):
+    return f"{int(round(x))}" if x is not None else "—"
+
 # ---------- read payload ----------
 event_path = os.environ["GITHUB_EVENT_PATH"]
-payload = json.load(open(event_path, "r")).get("client_payload", {})
+event_obj = json.load(open(event_path, "r"))
+payload = event_obj.get("client_payload", {})
 
 job_id = payload.get("job_id", "no_job")
 tz     = payload.get("tz","")
 date   = payload.get("date","")
-cities = payload.get("cities", [])  # ожидаем ровно 2
+cities = payload.get("cities", [])  # ожидаем до 2 городов
 
 # ---------- assets ----------
-ROOT   = Path(__file__).resolve().parents[1]  # корень репозитория
+ROOT   = Path(__file__).resolve().parents[1]
 assets = ROOT / "assets"
 icons  = assets / "icons"
 
-# фон
 base_path = assets / "base_weather_plain_panel.png"
 base = Image.open(base_path).convert("RGBA")
 W, H = base.size
 
-# шрифты (загрузи свои ttf в assets/fonts, напр. Inter)
 fonts_dir = assets / "fonts"
 font_bold  = load_font([
     fonts_dir/"Inter-SemiBold.ttf",
     fonts_dir/"Roboto-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 ], size=46)
-
 font_reg   = load_font([
     fonts_dir/"Inter-Regular.ttf",
     fonts_dir/"Roboto-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 ], size=36)
-
 font_small = load_font([
     fonts_dir/"Inter-Regular.ttf",
     fonts_dir/"Roboto-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 ], size=28)
 
-# холст
 img = base.copy()
 draw = ImageDraw.Draw(img)
 
-# верхняя строка (дата/таймзона)
 if date or tz:
     hdr = f"{date} • {tz}".strip(" •")
     draw_text_centered(draw, (W/2, 40), hdr, font_small)
 
-# разбивка холста на 2 равные панели
 panels = [
     (0, 0, W//2, H),
     (W//2, 0, W, H),
@@ -88,7 +91,6 @@ def paste_icon(center_xy, icon_name):
     if not p.exists():
         p = icons / "cloud.png"
     ico = Image.open(p).convert("RGBA")
-    # масштаб под высоту панели
     target_h = int(H * 0.45)
     ratio = target_h / ico.height
     ico = ico.resize((int(ico.width*ratio), target_h), Image.LANCZOS)
@@ -101,40 +103,35 @@ def render_city(panel_box, city):
     cx = (L + R)//2
 
     name = city.get("name","")
-    cur  = city.get("current", {})
-    daily= city.get("daily", {})
-    temp = cur.get("temp")
-    wind = cur.get("wind")
-    code = int(cur.get("code") or 0)
-    tmax = daily.get("tmax")
-    tmin = daily.get("tmin")
-    pr   = daily.get("precip")
+    cur  = city.get("current", {}) or {}
+    daily= city.get("daily", {}) or {}
 
-    # название города
+    temp = to_float(cur.get("temp"))
+    wind = to_float(cur.get("wind"))
+    code = int(to_float(cur.get("code")) or 0)
+
+    tmax = to_float(daily.get("tmax"))
+    tmin = to_float(daily.get("tmin"))
+    pr   = to_float(daily.get("precip"))
+
     draw_text_centered(draw, (cx, T + 80), name, font_bold)
-
-    # иконка
     paste_icon((cx, T + int(H*0.48)), icon_name_by_wmo(code))
 
-    # температура, ветер
-    line1 = f"{round(temp)}°C  •  wind {round(wind)}"
+    line1 = f"{fmt_num(temp)}°C  •  wind {fmt_num(wind)}"
     draw_text_centered(draw, (cx, T + int(H*0.78)), line1, font_reg)
 
-    # min/max/precip
     tail = []
     if tmin is not None and tmax is not None:
-        tail.append(f"{round(tmin)}…{round(tmax)}°C")
+        tail.append(f"{fmt_num(tmin)}…{fmt_num(tmax)}°C")
     if pr is not None:
-        tail.append(f"rain {round(pr)}%")
+        tail.append(f"rain {fmt_num(pr)}%")
     if tail:
         draw_text_centered(draw, (cx, T + int(H*0.90)), "  •  ".join(tail), font_small)
 
-# гарантируем 2 панели (если пришёл 1 город — нарисуем его слева)
 for i, panel in enumerate(panels):
     data = cities[i] if i < len(cities) else {}
     render_city(panel, data)
 
-# запись файла
 out_dir = ROOT / "weather"
 out_dir.mkdir(parents=True, exist_ok=True)
 out_path = out_dir / f"{job_id}.png"
