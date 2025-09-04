@@ -11,13 +11,11 @@ jobs:
   render:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -31,6 +29,15 @@ jobs:
           GITHUB_EVENT_PATH: ${{ github.event_path }}
         run: python scripts/render.py
 
+      # (не обязательно, но полезно — вывести ссылку в Summary)
+      - name: Output image URL
+        id: out
+        shell: bash
+        run: |
+          URL="https://raw.githubusercontent.com/${{ github.repository }}/main/weather/${{ github.event.client_payload.job_id }}.png?${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "URL=$URL" >> "$GITHUB_OUTPUT"
+          echo "Image: $URL" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Commit & push result
         run: |
           git config user.name  "github-actions[bot]"
@@ -38,22 +45,3 @@ jobs:
           git add weather/*.png
           git commit -m "render: ${{ github.event.client_payload.job_id }}" || echo "nothing to commit"
           git push
-
-      - name: Notify Make hook
-        env:
-          HOOK_URL: https://hook.us2.make.com/9ejywo14eq635idx1w1jreli0tf888cs
-          JOB_ID: ${{ github.event.client_payload.job_id }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          SHA: ${{ github.sha }}
-        run: |
-          IMG_URL="https://raw.githubusercontent.com/${REPO}/main/weather/${JOB_ID}.png"
-          curl -sS -X POST "$HOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n \
-                  --arg job_id "$JOB_ID" \
-                  --arg img_url "$IMG_URL" \
-                  --arg repo "$REPO" \
-                  --arg run_id "$RUN_ID" \
-                  --arg sha "$SHA" \
-                  '{job_id:$job_id, ok:true, img_url:$img_url, repo:$repo, run_id:$run_id, sha:$sha}')"
