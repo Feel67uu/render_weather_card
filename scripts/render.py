@@ -1,4 +1,4 @@
-# scripts/render.py — two-city weather card, frosted glass, RU UI
+# scripts/render.py — two-city weather card, frosted glass, RU UI (with logo badge & white bg)
 
 from __future__ import annotations
 import json, os, random
@@ -91,10 +91,6 @@ def load_font(sz: int, bold=False) -> ImageFont.FreeTypeFont:
     except Exception:
         return ImageFont.load_default()
 
-def txt_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int,int]:
-    l,t,r,b = draw.textbbox((0,0), text, font=font)
-    return r-l, b-t
-
 def draw_shadowed(draw, xy, text, font, fill=WHITE, shadow=TEXT_SHADOW, anchor="mm", off=(0,2)):
     x,y = xy
     draw.text((x+off[0], y+off[1]), text, font=font, fill=shadow, anchor=anchor)
@@ -110,6 +106,13 @@ def gradient_bg(size, top, bottom) -> Image.Image:
         b = int(top[2]*(1-k)+bottom[2]*k)
         strip.putpixel((0,y),(r,g,b))
     return strip.resize((w,h), Image.BILINEAR)
+
+def make_bg(payload: Dict[str,Any]) -> Image.Image:
+    ui = (payload.get("ui") or {})
+    bg = (ui.get("bg") or "").lower()
+    if bg in ("white","tg-white","light"):
+        return Image.new("RGBA", (W, H), (255,255,255,255))
+    return gradient_bg((W,H), BG_TOP, BG_BOTTOM).convert("RGBA")
 
 def weather_effect(canvas: Image.Image, code: int):
     """Rain / snow overlay depending on weather code (very subtle)."""
@@ -164,7 +167,46 @@ def cond_text(code: int) -> str:
         "storm": COND_RU["storm"],
     }[icon_name(code).split(".")[0]]
 
-# frosted glass panel (blur underlying bg)
+# ---- logo badge helpers ----
+def load_logo_circle(path: str, diameter_px: int) -> Image.Image:
+    """Load square logo, fit to diameter and apply perfect circular mask with white ring."""
+    if diameter_px <= 0:
+        return Image.new("RGBA", (1,1), (0,0,0,0))
+    try:
+        im = Image.open(path).convert("RGBA")
+    except Exception:
+        im = Image.new("RGBA", (512,512), (0,0,0,0))
+    im = im.resize((diameter_px, diameter_px), Image.LANCZOS)
+    mask = Image.new("L", (diameter_px, diameter_px), 0)
+    ImageDraw.Draw(mask).ellipse((0,0,diameter_px-1,diameter_px-1), fill=255)
+    circle = Image.new("RGBA", (diameter_px, diameter_px), (0,0,0,0))
+    circle.paste(im, (0,0), mask)
+    # white ring
+    ring = Image.new("RGBA", (diameter_px, diameter_px), (0,0,0,0))
+    d = ImageDraw.Draw(ring, "RGBA")
+    d.ellipse((1,1,diameter_px-2,diameter_px-2),
+              outline=(255,255,255,255), width=max(3,int(diameter_px*0.03)))
+    circle = Image.alpha_composite(circle, ring)
+    return circle
+
+def paste_badge(canvas: Image.Image, badge: Image.Image, margin_px: int):
+    """Put soft shadow + circular badge at bottom-right. Returns occupied width (safe area)."""
+    d = badge.width
+    if d <= 1:
+        return 0
+    # soft shadow
+    shadow = Image.new("RGBA", (d+40, d+40), (0,0,0,0))
+    sd = ImageDraw.Draw(shadow, "RGBA")
+    sd.ellipse((20,20,d+20,d+20), fill=(0,0,0,80))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(16))
+    # coords
+    x = W - margin_px - d
+    y = H - margin_px - d
+    canvas.alpha_composite(shadow, (x-10, y-10))
+    canvas.alpha_composite(badge, (x, y))
+    return d + margin_px + int(8*SCALE)
+
+# ---- frosted glass panel ----
 def frosted_panel(bg: Image.Image, dst: Image.Image, rect: Tuple[int,int,int,int], radius=40, fill_alpha=70):
     x1,y1,x2,y2 = rect
     crop = bg.crop(rect).filter(ImageFilter.GaussianBlur(18))
@@ -178,11 +220,18 @@ def frosted_panel(bg: Image.Image, dst: Image.Image, rect: Tuple[int,int,int,int
     d2 = ImageDraw.Draw(stroke, "RGBA")
     d2.rounded_rectangle((1,1, stroke.width-2, stroke.height-2), radius=radius, outline=PANEL_STROKE, width=3)
     frosted = Image.alpha_composite(frosted, stroke)
+    # soft outer shadow under the panel
+    shadow = Image.new("RGBA", (x2-x1+40, y2-y1+40), (0,0,0,0))
+    sd = ImageDraw.Draw(shadow, "RGBA")
+    sd.rounded_rectangle((20,20, shadow.width-20, shadow.height-20), radius=radius+10, fill=(0,0,0,70))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(16))
+    dst.paste(shadow, (x1-20, y1-20), shadow)
     dst.paste(frosted, (x1,y1), mask)
 
 # ---------- card ----------
 def draw_city_card(bg: Image.Image, canvas: Image.Image, rect: Tuple[int,int,int,int],
-                   city: Dict[str,Any], payload: Dict[str,Any], fonts: Dict[str,ImageFont.FreeTypeFont]):
+                   city: Dict[str,Any], payload: Dict[str,Any], fonts: Dict[str,ImageFont.FreeTypeFont],
+                   avoid_right: bool=False, safe_right_px: int=0):
     x1,y1,x2,y2 = rect
     cx, cy = (x1+x2)//2, (y1+y2)//2
     w,h = x2-x1, y2-y1
@@ -223,14 +272,21 @@ def draw_city_card(bg: Image.Image, canvas: Image.Image, rect: Tuple[int,int,int
     rng_y = cond_y + int(52*SCALE)
     d.text((big_x, rng_y), rng, font=fonts["medium"], fill=WHITE, anchor="mm")
 
-    # status row (bottom, centered): wind + precip probability
+    # status: two lines at bottom (wind, precip), shift left for right card if badge present
+    wind_val = cur.get('wind', 0)
     precip_val = daily.get('precip_prob')
     if precip_val is None:
         precip_val = daily.get('precip', 0)
 
-    status = f"{fmt_wind(cur.get('wind',0))}  •  {fmt_precip(precip_val)}"
-    stat_y = y2 - int(h*0.12)  # lower for nicer balance
-    d.text((cx, stat_y), status, font=fonts["small"], fill=WHITE_MUT, anchor="mm")
+    stat_cx = cx
+    if avoid_right and safe_right_px > 0:
+        stat_cx = cx - safe_right_px//2
+
+    line1_y = y2 - int(h*0.22)
+    line2_y = line1_y + int(40*SCALE)
+
+    d.text((stat_cx, line1_y), fmt_wind(wind_val), font=fonts["small"], fill=WHITE_MUT, anchor="mm")
+    d.text((stat_cx, line2_y), fmt_precip(precip_val), font=fonts["small"], fill=WHITE_MUT, anchor="mm")
 
 def col_rect(ix: int) -> Tuple[int,int,int,int]:
     margin = int(60*SCALE)
@@ -249,12 +305,12 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     out_path = OUT / f"{job_id}.png"
 
-    # background with subtle weather effect (by first city code if есть)
-    bg = gradient_bg((W,H), BG_TOP, BG_BOTTOM).convert("RGBA")
+    # background & subtle weather overlay
+    bg = make_bg(payload)
+    canvas = bg.copy()
     if cities:
         code0 = ((cities[0] or {}).get("current") or {}).get("code", 3)
-        weather_effect(bg, code0)
-    canvas = bg.copy()
+        weather_effect(canvas, code0)
 
     # fonts (2×)
     fonts = {
@@ -264,12 +320,24 @@ def main():
         "small":  load_font(int(30*SCALE), bold=False),
     }
 
+    # badge params (safe area for right card)
+    ui_logo    = ((payload.get("ui") or {}).get("logo") or {})
+    logo_path  = ui_logo.get("path") or str(ASSETS / "brand" / "prokis512.png")
+    logo_diam  = int(to_float(ui_logo.get("diameter") or 240)) * SCALE
+    logo_marg  = int(to_float(ui_logo.get("margin") or 28)) * SCALE
+    safe_right = (logo_diam + logo_marg + int(8*SCALE)) if logo_diam > 0 else 0
+
     if len(cities) < 2:
         d = ImageDraw.Draw(canvas)
         draw_shadowed(d, (W//2, H//2), "Недостаточно данных", load_font(72*SCALE, True))
     else:
-        draw_city_card(bg, canvas, col_rect(0), cities[0], payload, fonts)
-        draw_city_card(bg, canvas, col_rect(1), cities[1], payload, fonts)
+        draw_city_card(bg, canvas, col_rect(0), cities[0], payload, fonts, avoid_right=False, safe_right_px=0)
+        draw_city_card(bg, canvas, col_rect(1), cities[1], payload, fonts, avoid_right=True,  safe_right_px=safe_right)
+
+    # badge on top
+    if logo_diam > 0:
+        badge = load_logo_circle(logo_path, logo_diam)
+        paste_badge(canvas, badge, logo_marg)
 
     final = canvas.resize((BASE_W, BASE_H), Image.LANCZOS)
     final.save(out_path)
