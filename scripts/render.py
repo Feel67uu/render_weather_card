@@ -25,9 +25,9 @@ SCALE          = 2
 W, H           = BASE_W*SCALE, BASE_H*SCALE
 
 # ---------- colors ----------
-WHITE      = (255,255,255,255)
-WHITE_MUT  = (220,230,240,255)
-MUTED      = (200,210,220,255)
+WHITE        = (255,255,255,255)
+WHITE_MUT    = (220,230,240,255)
+MUTED        = (200,210,220,255)
 PANEL_STROKE = (255,255,255,90)
 TEXT_SHADOW  = (0,0,0,140)
 
@@ -47,12 +47,25 @@ def load_payload() -> Dict[str,Any]:
     return evt.get("client_payload") or {}
 
 def to_float(x, default=0.0) -> float:
-    try: return float(x)
-    except Exception: return float(default)
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
 
-def fmt_temp(v) -> str: return f"{int(round(to_float(v))):+d}°C"
-def fmt_wind(v) -> str: return f"ветер {int(round(to_float(v)))} м/с"
-def fmt_rain(p) -> str:  return f"дождь {int(round(to_float(p)))}%"
+def fmt_temp(v) -> str:
+    return f"{int(round(to_float(v))):+d}°C"
+
+def fmt_wind(v) -> str:
+    return f"ветер {int(round(to_float(v)))} м/с"
+
+def fmt_precip(p) -> str:
+    # «вероятность осадков», дружим со строками '12', '12.3', '12,3'
+    try:
+        v = int(round(float(str(p).replace(',', '.'))))
+    except Exception:
+        v = 0
+    v = max(0, min(100, v))
+    return f"вероятность осадков {v}%"
 
 def tomorrow_label(today_iso: str, tz: str) -> str:
     try:
@@ -60,8 +73,10 @@ def tomorrow_label(today_iso: str, tz: str) -> str:
     except Exception:
         d0 = datetime.utcnow()
     if ZoneInfo and tz:
-        try: d0 = d0.replace(tzinfo=ZoneInfo(tz))
-        except Exception: pass
+        try:
+            d0 = d0.replace(tzinfo=ZoneInfo(tz))
+        except Exception:
+            pass
     d1 = (d0 + timedelta(days=1)).date()
     return f"Завтра, {RU_DOW[d1.weekday()]}, {d1.day} {RU_MON[d1.month-1]}"
 
@@ -208,9 +223,13 @@ def draw_city_card(bg: Image.Image, canvas: Image.Image, rect: Tuple[int,int,int
     rng_y = cond_y + int(52*SCALE)
     d.text((big_x, rng_y), rng, font=fonts["medium"], fill=WHITE, anchor="mm")
 
-    # status row
-    status = f"{fmt_wind(cur.get('wind',0))}  •  {fmt_rain(daily.get('precip_prob',0))}"
-    stat_y = y2 - int(h*0.16)
+    # status row (bottom, centered): wind + precip probability
+    precip_val = daily.get('precip_prob')
+    if precip_val is None:
+        precip_val = daily.get('precip', 0)
+
+    status = f"{fmt_wind(cur.get('wind',0))}  •  {fmt_precip(precip_val)}"
+    stat_y = y2 - int(h*0.12)  # lower for nicer balance
     d.text((cx, stat_y), status, font=fonts["small"], fill=WHITE_MUT, anchor="mm")
 
 def col_rect(ix: int) -> Tuple[int,int,int,int]:
